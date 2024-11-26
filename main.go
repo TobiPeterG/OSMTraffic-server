@@ -1,186 +1,171 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/xml"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
-	"os"
-	"time"
-
-	"github.com/go-chi/chi/v5"
-	"github.com/go-redis/redis/v8"
 )
 
-var rdb *redis.Client
+// TraFF represents the root element of the TraFF XML structure.
+type TraFF struct {
+	XMLName  xml.Name  `xml:"traff"`
+	Messages []Message `xml:"message"`
+}
+
+// Message represents each traffic message in the TraFF XML.
+type Message struct {
+	XMLName  xml.Name `xml:"message"`
+	Location Location `xml:"location"`
+	Events   []Event  `xml:"events>event"`
+}
+
+// Location encapsulates the geographical details of the traffic event.
+type Location struct {
+	From         Point    `xml:"from"`
+	To           Point    `xml:"to"`
+	Polyline     Polyline `xml:"polyline"`
+	JunctionRef  string   `xml:"junction_ref,attr,omitempty"`
+	JunctionName string   `xml:"junction_name,attr,omitempty"`
+}
+
+// Point represents a geographical point with latitude and longitude.
+type Point struct {
+	Lat float64 `xml:"lat"`
+	Lon float64 `xml:"lon"`
+}
+
+// Polyline represents a series of geographical coordinates.
+type Polyline struct {
+	Coordinates []Coordinate `xml:"coordinates>coordinate"`
+}
+
+// Coordinate represents a single geographical coordinate.
+type Coordinate struct {
+	Lon float64 `xml:"lon"`
+	Lat float64 `xml:"lat"`
+}
+
+// Event represents a traffic event with its details.
+type Event struct {
+	Class       string `xml:"class,attr"`
+	Type        string `xml:"type,attr"`
+	Speed       string `xml:"speed,attr,omitempty"`
+	Description string `xml:"description,omitempty"`
+}
+
+// Mapping from Autobahn API abnormalTrafficType to TraFF Class and Type.
+var autobahnToTraFF = map[string]struct {
+	Class string
+	Type  string
+}{
+	"STATIONARY_TRAFFIC": {"CONGESTION", "CONGESTION_QUEUE"},
+	"SLOW_TRAFFIC":       {"CONGESTION", "CONGESTION_SLOW_TRAFFIC"},
+	"HEAVY_TRAFFIC":      {"CONGESTION", "CONGESTION_HEAVY_TRAFFIC"},
+	"TRAFFIC_BUILDUP":    {"CONGESTION", "CONGESTION_TRAFFIC_BUILDING_UP"},
+	"ACCIDENT":           {"INCIDENT", "INCIDENT_ACCIDENT"},
+	"ROADWORKS":          {"CONSTRUCTION", "CONSTRUCTION_ROADWORKS"},
+	"BLOCKAGE":           {"RESTRICTION", "RESTRICTION_BLOCKED"},
+	"HAZARD":             {"HAZARD", "HAZARD_OBSTRUCTION"},
+	// Add more mappings as needed
+}
+
+// translateToTraFFType translates Autobahn API event types to TraFF event types.
+func translateToTraFFType(apiType string) (class string, eventType string, ok bool) {
+	mapping, exists := autobahnToTraFF[apiType]
+	if exists {
+		return mapping.Class, mapping.Type, true
+	}
+	return "", "", false
+}
+
+// ConvertToTraFF converts filtered warnings into the TraFF XML format.
+func ConvertToTraFF(warnings []Warning) (string, error) {
+	traff := TraFF{}
+
+	for _, warning := range warnings {
+		class, eventType, ok := translateToTraFFType(warning.AbnormalTrafficType)
+		if !ok {
+			log.Printf("Unknown Autobahn API type: %s", warning.AbnormalTrafficType)
+			continue // Skip unknown types
+		}
+
+		// Parse the 'point' field to extract latitude and longitude.
+		var fromLat, fromLon float64
+		n, err := fmt.Sscanf(warning.Point, "%f,%f", &fromLat, &fromLon)
+		if err != nil || n != 2 {
+			log.Printf("Failed to parse point: %s", warning.Point)
+			continue // Skip if point parsing fails
+		}
+
+		// Construct the polyline coordinates.
+		var polyline Polyline
+		for _, coord := range warning.Geometry.Coordinates {
+			if len(coord) != 2 {
+				log.Printf("Invalid coordinate pair: %v", coord)
+				continue
+			}
+			lon, lat := coord[0], coord[1]
+			polyline.Coordinates = append(polyline.Coordinates, Coordinate{Lon: lon, Lat: lat})
+		}
+
+		// Determine the 'to' point from the last coordinate.
+		var toPoint Point
+		if len(polyline.Coordinates) > 0 {
+			lastCoord := polyline.Coordinates[len(polyline.Coordinates)-1]
+			toPoint = Point{Lat: lastCoord.Lat, Lon: lastCoord.Lon}
+		}
+
+		// Get the first description if available.
+		description := "No description available"
+		if len(warning.Description) > 0 && warning.Description[0] != "" {
+			description = warning.Description[0]
+		}
+
+		// Create the Event.
+		event := Event{
+			Class:       class,
+			Type:        eventType,
+			Speed:       warning.AverageSpeed,
+			Description: description,
+		}
+
+		// Create the Message.
+		message := Message{
+			Location: Location{
+				From:     Point{Lat: fromLat, Lon: fromLon},
+				To:       toPoint,
+				Polyline: polyline,
+				// JunctionRef and JunctionName can be set here if available.
+			},
+			Events: []Event{event},
+		}
+
+		// Append the message to the TraFF structure.
+		traff.Messages = append(traff.Messages, message)
+	}
+
+	// Serialize the TraFF structure to XML.
+	output, err := xml.MarshalIndent(traff, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize XML: %w", err)
+	}
+
+	return string(output), nil
+}
 
 func main() {
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "redis:6379"
-	}
-
-	// Initialize Redis client
-	rdb = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
-
-	// Create a new router using Chi
-	r := chi.NewRouter()
-
-	// Define routes
-	r.Get("/traffic", TrafficHandler)
-
-	// Start the HTTP server
-	fmt.Println("Starting server on :8080...")
-	http.ListenAndServe(":8080", r)
-}
-
-// TrafficHandler handles requests to the /traffic endpoint
-func TrafficHandler(w http.ResponseWriter, r *http.Request) {
-	// Fetch traffic data (integrating Datex2 API)
-	trafficData := FetchTrafficData()
-
-	// Send the traffic data to the client in GeoJSON format
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(trafficData))
-}
-
-// FetchTrafficData fetches traffic data, checks Redis cache first
-func FetchTrafficData() string {
-	ctx := context.Background()
-
-	// Try to get data from Redis cache
-	val, err := rdb.Get(ctx, "traffic_data").Result()
-	if err == redis.Nil {
-		// Cache miss, so fetch from the data source (Datex2)
-		fmt.Println("Cache miss. Fetching from Datex2...")
-		trafficData := GetTrafficData()
-
-		// Store in cache with an expiration time (e.g., 5 minutes)
-		rdb.Set(ctx, "traffic_data", trafficData, 5*time.Minute)
-
-		return trafficData
-	} else if err != nil {
-		// Handle other Redis errors
-		log.Println("Redis error:", err)
-		return "[]"
-	}
-
-	// Cache hit, return cached traffic data
-	fmt.Println("Cache hit.")
-	return val
-}
-
-// GetTrafficData fetches the traffic data and formats it into GeoJSON
-func GetTrafficData() string {
-	// Define the API endpoint
-	url := "https://verkehr.autobahn.de/o/autobahn/A1/services/warning"
-
-	// Create an HTTP client and make a GET request to the API
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	// Fetch warnings from the Autobahn API.
+	warnings, err := FetchWarnings()
 	if err != nil {
-		log.Println("Error fetching traffic data:", err)
-		return `{"error": "Failed to fetch traffic data"}`
-	}
-	defer resp.Body.Close()
-
-	// Check if the request was successful
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Error: received non-200 status code: %d\n", resp.StatusCode)
-		return `{"error": "Invalid response from traffic API"}`
+		log.Fatalf("Error fetching warnings: %v", err)
 	}
 
-	// Read the response body
-	body, err := ioutil.ReadAll(resp.Body)
+	// Convert the warnings to TraFF XML.
+	xmlOutput, err := ConvertToTraFF(warnings)
 	if err != nil {
-		log.Println("Error reading response body:", err)
-		return `{"error": "Failed to read traffic data"}`
+		log.Fatalf("Error converting to TraFF: %v", err)
 	}
 
-	// Convert the raw traffic data into a structured format
-	var rawTrafficData map[string][]map[string]interface{}
-	if err := json.Unmarshal(body, &rawTrafficData); err != nil {
-		log.Println("Error parsing JSON response:", err)
-		return `{"error": "Failed to parse traffic data"}`
-	}
-
-	// Prepare GeoJSON format
-	geoJSON := map[string]interface{}{
-		"type":     "FeatureCollection",
-		"features": []map[string]interface{}{},
-	}
-
-	// Loop through the traffic data and format it as GeoJSON features
-	for _, item := range rawTrafficData["warning"] {
-		// Extract point coordinates
-		pointCoordinates := item["point"].(string) // Example: "49.89161871011858,6.851523798786332"
-		var lat, lon float64
-		fmt.Sscanf(pointCoordinates, "%f,%f", &lat, &lon)
-
-		// Extract LineString coordinates
-		geometry, ok := item["geometry"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		lineCoordinates := [][]float64{}
-		for _, coord := range geometry["coordinates"].([]interface{}) {
-			coordPair := coord.([]interface{})
-			longitude := coordPair[0].(float64)
-			latitude := coordPair[1].(float64)
-			lineCoordinates = append(lineCoordinates, []float64{longitude, latitude})
-		}
-
-		// Create a LineString feature
-		lineFeature := map[string]interface{}{
-			"type": "Feature",
-			"geometry": map[string]interface{}{
-				"type":        "LineString",
-				"coordinates": lineCoordinates,
-			},
-			"properties": map[string]interface{}{
-				"title":               item["title"],
-				"subtitle":            item["subtitle"],
-				"abnormalTrafficType": item["abnormalTrafficType"],
-				"averageSpeed":        item["averageSpeed"],
-				"startTimestamp":      item["startTimestamp"],
-				"description":         item["description"],
-			},
-		}
-
-		// Add the LineString feature to the features list
-		geoJSON["features"] = append(geoJSON["features"].([]map[string]interface{}), lineFeature)
-
-		// Create a Point feature
-		pointFeature := map[string]interface{}{
-			"type": "Feature",
-			"geometry": map[string]interface{}{
-				"type":        "Point",
-				"coordinates": []float64{lon, lat},
-			},
-			"properties": map[string]interface{}{
-				"title":               item["title"],
-				"subtitle":            item["subtitle"],
-				"abnormalTrafficType": item["abnormalTrafficType"],
-				"averageSpeed":        item["averageSpeed"],
-				"startTimestamp":      item["startTimestamp"],
-				"description":         item["description"],
-			},
-		}
-
-		// Add the Point feature to the features list
-		geoJSON["features"] = append(geoJSON["features"].([]map[string]interface{}), pointFeature)
-	}
-
-	// Convert the GeoJSON structure to a JSON string
-	geoJSONBytes, err := json.Marshal(geoJSON)
-	if err != nil {
-		log.Println("Error marshalling GeoJSON:", err)
-		return `{"error": "Failed to generate GeoJSON"}`
-	}
-
-	return string(geoJSONBytes)
+	// Print the XML output.
+	fmt.Println(xmlOutput)
 }
